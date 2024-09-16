@@ -3,19 +3,21 @@ package controllers
 import (
 	"bytes"
 	"encoding/json"
-	"io"
+	"log"
 	"net/http"
 	"strconv"
-	"verve-task/repositories"
+	"verve-task/services"
 )
 
 type HttpController struct {
-	MemoryRepo *repositories.MemoryStore
+	MemoryService *services.MemoryStore
+	KafkaService  *services.KafkaProducer
 }
 
-func NewHttpController(memoryRepo *repositories.MemoryStore) *HttpController {
+func NewHttpController(memoryRepo *services.MemoryStore, kafkaService *services.KafkaProducer) *HttpController {
 	return &HttpController{
-		MemoryRepo: memoryRepo,
+		MemoryService: memoryRepo,
+		KafkaService:  kafkaService,
 	}
 }
 func (h *HttpController) HandleRequest(w http.ResponseWriter, r *http.Request) {
@@ -35,8 +37,18 @@ func (h *HttpController) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if the request is logged
-	if !h.MemoryRepo.IsLogged(id) {
-		h.MemoryRepo.LogRequest(id)
+	if !h.MemoryService.IsLogged(id) {
+		err := h.MemoryService.LogRequest(id)
+		if err != nil {
+			http.Error(w, "failed", http.StatusInternalServerError)
+			return
+		}
+		// write to streaming service
+		err = h.KafkaService.WriteMsg(idParam)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// calling endpoint if provided
@@ -47,21 +59,24 @@ func (h *HttpController) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer response.Body.Close()
-
-		respBody, err := io.ReadAll(response.Body)
+		err = h.MemoryService.OpenLogFile()
 		if err != nil {
 			http.Error(w, "failed", http.StatusInternalServerError)
 			return
 		}
-		w.Write(respBody)
-		return
+		log.Printf("Endpoint response status code %v", response.StatusCode)
+		err = h.MemoryService.CloseLogFile()
+		if err != nil {
+			http.Error(w, "failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.Write([]byte("Ok"))
 }
 
 func (h *HttpController) callEndpoint(endpoint string, title string) (*http.Response, error) {
-	requestBody := map[string]string{"title": title, "count": strconv.Itoa(len(h.MemoryRepo.LoggedReqIds))}
+	requestBody := map[string]string{"title": title, "count": strconv.Itoa(len(h.MemoryService.LoggedReqIds))}
 
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
